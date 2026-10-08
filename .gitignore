@@ -1,0 +1,23 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/app/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+.kotlin/
+/dist/
+
+# Signing material — never commit (it lives in ../_keys/MealSip)
+keystore.properties
+signing.properties
+secrets.txt
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.base64
+/signing/

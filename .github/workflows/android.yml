@@ -1,0 +1,175 @@
+name: Android CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "17"
+  BUILD_TOOLS: "36.0.0"
+  BUNDLETOOL_VERSION: "1.17.2"
+  # Step 1 of the release plan: verify the signed NON-minified release first.
+  # Flip to "true" only after that pass is green; it then repeats every check on an R8 build.
+  R8_PASS: "false"
+  APK: app/build/outputs/apk/release/app-release.apk
+  AAB: app/build/outputs/bundle/release/app-release.aab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Focused unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Room schema check
+        run: |
+          F=app/schemas/com.egrmeister.mealsip.data.local.AppDatabase/1.json
+          if [ ! -f "$F" ]; then
+            echo "::error::Room schema v1 was not exported to $F"; find app -name '1.json' -path '*schema*' || true; exit 1
+          fi
+          if git ls-files --error-unmatch "$F" > /dev/null 2>&1; then
+            git diff --exit-code -- app/schemas || { echo "::error::Committed Room schema differs from the generated one"; exit 1; }
+            echo "Committed Room schema matches the generated schema."
+          else
+            echo "::warning::Room schema v1 is not committed yet. Generated schema follows:"
+            cat "$F"
+          fi
+
+      - name: Release lint
+        run: ./gradlew --no-daemon lintRelease
+
+      - name: Require signing secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          missing=0
+          for v in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!v}" ]; then echo "::error::GitHub secret $v is missing"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Decode keystore (temporary)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set +x
+          KS="$RUNNER_TEMP/mealsip-release.p12"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > "$KS"
+          chmod 600 "$KS"
+          echo "ANDROID_KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
+          SHA=$(keytool -list -v -storetype PKCS12 -keystore "$KS" -storepass "$ANDROID_KEYSTORE_PASSWORD" -alias "$ANDROID_KEY_ALIAS" \
+            | grep -m1 "SHA256:" | sed 's/.*SHA256: //' | tr -d ': ' | tr 'a-f' 'A-F')
+          test -n "$SHA" || { echo "::error::Could not read the upload certificate from the keystore"; exit 1; }
+          echo "EXPECTED_CERT_SHA256=$SHA" >> "$GITHUB_ENV"
+          echo "Upload certificate SHA-256: $SHA"
+
+      - name: Fetch bundletool
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/bundletool.jar" \
+            "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar"
+          echo "BUNDLETOOL_JAR=$RUNNER_TEMP/bundletool.jar" >> "$GITHUB_ENV"
+          echo "BUILD_TOOLS_DIR=$ANDROID_HOME/build-tools/$BUILD_TOOLS" >> "$GITHUB_ENV"
+
+      - name: Build signed release (non-minified)
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon -Pmealsip.minify=false assembleRelease bundleRelease
+
+      - name: Verify non-minified release
+        run: bash .github/scripts/verify-release.sh non-minified "$APK" "$AAB" dist/non-minified
+
+      - name: Build signed release (R8 + resource shrinking)
+        if: env.R8_PASS == 'true'
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon -Pmealsip.minify=true assembleRelease bundleRelease
+
+      - name: Verify R8 release
+        if: env.R8_PASS == 'true'
+        run: |
+          bash .github/scripts/verify-release.sh minified "$APK" "$AAB" dist/minified
+          cp app/build/outputs/mapping/release/mapping.txt dist/minified/mapping.txt
+
+      - name: Release report
+        run: |
+          {
+            echo "# MealSip release report"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Upload certificate SHA-256: $EXPECTED_CERT_SHA256"
+            for d in dist/non-minified dist/minified; do
+              [ -d "$d" ] || continue
+              cat "$d/sizes.md"; echo; cat "$d/native-libs.md"; echo
+              echo "Permissions:"; cat "$d/permissions-summary.txt"; echo
+            done
+            echo "Google Play: upload ONLY the .aab."
+          } | tee dist/release-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verified artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mealsip-release-${{ github.run_number }}
+          if-no-files-found: error
+          path: |
+            dist/release-report.md
+            dist/*/app-release.apk
+            dist/*/app-release.aab
+            dist/*/apk-signature.txt
+            dist/*/permissions-summary.txt
+            dist/*/native-libs.md
+            dist/*/sizes.md
+            dist/minified/mapping.txt
+
+      - name: Upload Room schemas and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mealsip-schemas-and-reports-${{ github.run_number }}
+          if-no-files-found: ignore
+          path: |
+            app/schemas/
+            app/build/reports/
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/mealsip-release.p12"
+          rm -rf dist/*/so

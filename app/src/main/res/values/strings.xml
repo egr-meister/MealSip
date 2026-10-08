@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MealSip</string>
+    <string name="reminder_channel_name">Period reminders</string>
+    <string name="reminder_channel_description">Optional reminders to record water in a daily period.</string>
+    <string name="reminder_title">MealSip</string>
+    <string name="reminder_body">Would you like to record water in %1$s?</string>
+</resources>
